@@ -1,0 +1,73 @@
+# Hunts the Oracle A1 VM around the clock (hunt.sh). Each run hunts ~55 min, then starts the next
+# run itself; the cron is only a watchdog that restarts the chain if it ever breaks (it exits at
+# once while a hunt is running). When the VM is 2/12 (or prod moved) the workflow disables itself.
+# A broken hunt (e.g. the key revoked) opens one issue and keeps retrying, instead of a red run
+# (and an email) every hour.
+name: hunt
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write   # start the next run, disable the workflow when done
+  issues: write    # notify.sh
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Only one hunt at a time
+        id: gate
+        # The run that started this one is still finishing for a few seconds: wait up to a minute.
+        run: |
+          for _ in $(seq 12); do
+            older=$(gh run list -w hunt.yml --json databaseId,status \
+              --jq "[.[] | select((.status == \"in_progress\" or .status == \"queued\") and .databaseId < ${{ github.run_id }})] | length")
+            [[ $older == 0 ]] && break
+            sleep 5
+          done
+          echo "run=$([[ $older == 0 ]] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          [[ $older == 0 ]] || echo "Another hunt is running; this one stops here."
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'yes'
+
+      - name: Oracle CLI
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          VM_SSH_PUB: ${{ secrets.VM_SSH_PUB }}
+        run: |
+          pipx install --quiet oci-cli
+          mkdir -p ~/.oci && chmod 700 ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          printf '%s\nkey_file=%s\n' "$OCI_CONFIG" ~/.oci/key.pem > ~/.oci/config
+          printf '%s\n' "$VM_SSH_PUB" > ~/.oci/vm_ssh.pub
+          chmod 600 ~/.oci/*
+
+      - name: Hunt
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          OCI_CLI_CONFIG_FILE: /home/runner/.oci/config
+          SSH_PUB_FILE: /home/runner/.oci/vm_ssh.pub
+          COMPARTMENT: ${{ secrets.COMPARTMENT }}
+          SUBNET: ${{ secrets.SUBNET }}
+          NSG: ${{ secrets.NSG }}
+          ADS: ${{ secrets.ADS }}
+        run: |
+          set +e
+          ./hunt.sh; rc=$?
+          rm -rf ~/.oci
+          case $rc in
+            0) gh workflow run hunt.yml && echo "Next run started." ;;
+            10) gh workflow disable hunt.yml && echo "Nothing left to hunt; workflow disabled." ;;
+            *) ./notify.sh broken "$GITHUB_SERVER_URL/$GH_REPO/actions/runs/${{ github.run_id }}"
+               sleep 600; gh workflow run hunt.yml ;;
+          esac

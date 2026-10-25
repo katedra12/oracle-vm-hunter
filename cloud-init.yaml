@@ -1,0 +1,42 @@
+#cloud-config
+# P22.3 (D-204): first boot of the nora-prod VM (Ubuntu 24.04 arm64, A1 2/12). No secrets here:
+# instance metadata is readable on the VM and in the console, so the WireGuard key and Nora's
+# .env arrive over SSH afterwards (deploy/oci/setup-vm.sh).
+package_update: true
+package_upgrade: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - wireguard-tools
+  - unattended-upgrades
+  - jq
+  - sqlite3
+  - zstd
+  - rsync
+  - stress-ng
+  - iptables-persistent
+write_files:
+  - path: /etc/apt/apt.conf.d/52nora-unattended
+    content: |
+      // Security updates every night (A13); reboots only when one needs it, at 04:30.
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+  - path: /etc/ssh/sshd_config.d/50-nora.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+runcmd:
+  # Oracle's Ubuntu images end INPUT with a REJECT rule; open Nora's ports above it (the NSG
+  # is the outer firewall, this is the inner one). 22 stays open here: the NSG limits it.
+  - |
+    for spec in 443/tcp 7881/tcp 52100/tcp 7882/udp 3478/udp 52100/udp 51820/udp; do
+      iptables -I INPUT 5 -p "${spec#*/}" --dport "${spec%/*}" -m state --state NEW -j ACCEPT
+    done
+    iptables -I INPUT 5 -i wg0 -j ACCEPT
+    netfilter-persistent save
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  - systemctl restart ssh
+  - mkdir -p /srv/nora
+  - touch /var/lib/nora-cloud-init-done
