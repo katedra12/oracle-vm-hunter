@@ -8,6 +8,10 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long this run hunts (the runs it starts hunt 55)"
+        default: "55"
 
 permissions:
   actions: write   # start the next run, disable the workflow when done
@@ -61,6 +65,7 @@ jobs:
           SUBNET: ${{ secrets.SUBNET }}
           NSG: ${{ secrets.NSG }}
           ADS: ${{ secrets.ADS }}
+          HUNT_MINUTES: ${{ inputs.minutes || '55' }}
         run: |
           set +e
           ./hunt.sh; rc=$?
